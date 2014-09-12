@@ -103,15 +103,22 @@
 #include <EEPROM.h>
 
 // ***** CONSTANTS *****
+#define LOG_TEMPERATURES   1  // whether to log temperature data for the session
 #define CLOCK_INTERVAL   100  // how frequently the state machine checks for advancements (ms)
 #define SAMPLE_INTERVAL  500  // how frequently temperature measurements are updated (ms)
 #define CYCLE_INTERVAL  1000  // how frequently the oven cycles through the current phase's heating pattern (ms per bit)
 #define MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
 #define NUM_PHASES         4  // number of phases in a profile (always assume a final "cooling" phase)
-#define NUM_HEATERS        3  // number of heaters installed
+#define NUM_HEATERS        2  // number of heaters installed
 #define DEFAULT_PROFILE    0  // default temperature profile at startup (overridden by EEPROM)
 #define BUZZER_DURATION  250  // how long to play buzzer sounds
 #define ADDR_CURR_PROFILE  0  // address in EEPROM for storing the current profile ID
+#define NUM_TEMPERATURE_SAMPLES   200   // how many samples to take for temperature logs
+#define TEMPERATURE_LOG_INTERVAL 5000   // frequency to capture temperature logs (ms)
+#define TEMPERATURE_MULTIPLIER     16   // add precision upto 1/16 of a degree in temperature samples (ensure value still fits in 16bits!)
+#define SAMPLE_MULTIPLIER         128   // allow more accurate temperature interpolation in DisplayGraph
+#define GRAPH_ROWS                 24   // Number of rows in graph
+#define GRAPH_COLS                 64   // Number of columns in graph
 
 // ***** PRODUCT IDENTIFICATION *****
 const char* BRAND_ID = "ControLeo";
@@ -127,7 +134,6 @@ struct Hardware {
 Hardware hardware = { 0, {
     4, // upper heater pin
     5, // lower heater pin
-    6  // booster heater pin
   },
   ControLeo_LiquidCrystal(),
   ControLeo_MAX31855() };
@@ -155,8 +161,8 @@ struct ReflowPhase {
   int HeaterPattern[NUM_HEATERS];
   boolean AlarmOnExit;
 };
-ReflowPhase idlePhase    = { "Idle",                 0, RISE, 0, 0, 0, { 0b00000000, 0b00000000, 0b00000000 }, false };
-ReflowPhase coolingPhase = { "Cooling", MAX_START_TEMP, FALL, 0, 0, 0, { 0b00000000, 0b00000000, 0b00000000 }, false };
+ReflowPhase idlePhase    = { "Idle",                 0, RISE, 0, 0, 0, { 0b00000000, 0b00000000 }, false };
+ReflowPhase coolingPhase = { "Cooling", MAX_START_TEMP, FALL, 0, 0, 0, { 0b00000000, 0b00000000 }, false };
 
 struct ReflowProfile {
   char* Name;
@@ -166,25 +172,26 @@ ReflowProfile profiles[] = {
   {
     "Lead-free solder",
     {  //   Zone      Exit(C)  Direction  Min(S)  Max(S)  Tgt(S)     Upper       Lower       Boost       Alarm
-      { "Pre-heat",     150,     RISE,       0,      0,     90, { 0b11001101, 0b10111110, 0b01010011 }, false },
-      { "Soak",         205,     RISE,      30,    120,     30, { 0b01000100, 0b10101011, 0b00010000 }, false },
-      { "Liquidus",     235,     RISE,      30,     90,     60, { 0b11011110, 0b10111111, 0b01101101 }, false },
-      { "Reflow",       225,     FALL,      30,     90,     60, { 0b00010001, 0b01000100, 0b00000000 }, true },
+      { "Pre-heat",     150,     RISE,       0,      0,     90, { 0b11001101, 0b10111110 }, false },
+      { "Soak",         205,     RISE,      30,    120,     30, { 0b01000100, 0b10101011 }, false },
+      { "Liquidus",     235,     RISE,      30,     90,     60, { 0b11011110, 0b10111111 }, false },
+      { "Reflow",       225,     FALL,      30,     90,     60, { 0b00010001, 0b01000100 }, true },
     }
   },
   {
     "Leaded solder",
     {  //   Zone      Exit(C)  Direction  Min(S)  Max(S)  Tgt(S)     Upper       Lower       Boost       Alarm
-      { "Pre-heat",     145,     RISE,       0,      0,     90, { 0b11001101, 0b01110110, 0b01010011 }, false },
-      { "Soak",         180,     RISE,      30,    120,     30, { 0b01000100, 0b10101011, 0b00010001 }, false },
-      { "Liquidus",     210,     RISE,      30,     90,     60, { 0b10111110, 0b11110111, 0b00101000 }, true },
-      { "Reflow",       180,     FALL,      30,     90,     60, { 0b01000000, 0b00011000, 0b00000100 }, false },
+      { "Pre-heat",     145,     RISE,       0,      0,     90, { 0b11001101, 0b01110110 }, false },
+      { "Soak",         180,     RISE,      30,    120,     30, { 0b01010100, 0b10101011 }, false },
+      { "Liquidus",     210,     RISE,      30,     90,     60, { 0b10111110, 0b11110111 }, true },
+      { "Reflow",       180,     FALL,      30,     90,     60, { 0b00000000, 0b00000000 }, false },
     }
   },
 };
 #define NUM_PROFILES (sizeof(profiles)/sizeof(ReflowProfile)) //array size is computed from initialized data
 
 // ***** STATE TRACKING *****
+
 struct OvenState {
   int SelectedProfile;
   boolean IsFaulted;
@@ -195,18 +202,27 @@ struct OvenState {
   unsigned long NextClock;
   unsigned long NextSample;
   unsigned long NextCycle;
+  unsigned long NextTemperatureLog;
   int ActiveHeatCycle;
   int ActivePhase;
   unsigned long EnteredCurrentPhase;
   int SecInPhase;
+  unsigned NumTempSamples;
   unsigned long ActiveSince;
   ReflowPhase PhaseSchedule[NUM_PHASES + 2];
+#if LOG_TEMPERATURES
+  uint16_t TemperatureLogC[NUM_TEMPERATURE_SAMPLES];
+#endif
 };
 OvenState currentState = {
   -1, false, false, 0, 0,
-  0, CLOCK_INTERVAL, SAMPLE_INTERVAL, CYCLE_INTERVAL,
-  0, 0, 0, 0, 0,
-  { idlePhase, idlePhase, idlePhase, idlePhase, idlePhase, coolingPhase} };
+  0, CLOCK_INTERVAL, SAMPLE_INTERVAL, CYCLE_INTERVAL, TEMPERATURE_LOG_INTERVAL,
+  0, 0, 0, 0, 0, 0,
+  { idlePhase, idlePhase, idlePhase, idlePhase, idlePhase, coolingPhase},
+#if LOG_TEMPERATURES
+  { 0 },
+#endif
+};
 
 
 void setup()
@@ -249,12 +265,19 @@ void loop()
     currentState.NextCycle = CYCLE_INTERVAL;
     currentState.NextSample = SAMPLE_INTERVAL;
     currentState.EnteredCurrentPhase = 0;
+    currentState.NextTemperatureLog = TEMPERATURE_LOG_INTERVAL;
   }
 
   // check to see if we should capture a new temperature sample
   if (currentState.NextSample <= now) {
     CaptureTemperatureSample();
     currentState.NextSample = now + SAMPLE_INTERVAL;
+  }
+  
+  // check if we should log the current temperature
+  if (currentState.NextTemperatureLog <= now) {
+    LogTemperatureIfNeeded();
+    currentState.NextTemperatureLog = now + TEMPERATURE_LOG_INTERVAL;
   }
   
   // should we check for phase transition this cycle?
@@ -568,6 +591,85 @@ void CheckForPhaseTransition()
   }
 }
 
+void LogTemperatureIfNeeded() {
+  #if LOG_TEMPERATURES
+  if (!currentState.IsActive) return;
+  if (currentState.ActivePhase == 0) return;
+  if (currentState.NumTempSamples >= NUM_TEMPERATURE_SAMPLES) return;
+  currentState.TemperatureLogC[currentState.NumTempSamples++] = currentState.TemperatureC * TEMPERATURE_MULTIPLIER;
+  #endif //LOG_TEMPERATURES
+}
+
+void print3d(uint16_t num) {
+  if (num >= 100) {
+    int val = num / 100;
+    Serial.print(val);
+    num -= val * 100;
+  } else {
+    Serial.print(" ");
+  }
+  if (num >= 10) {
+    int val = num / 10;
+    Serial.print(val);
+    num -= val * 10;
+  } else {
+    Serial.print(" ");
+  }
+  Serial.print(num);
+}
+
+void DisplayTemperatureGraph()
+{
+  Serial.println("Temperature Profile:");
+  for (int i = 0; i < currentState.NumTempSamples; i++) {
+    Serial.print(i*5); Serial.print(" "); Serial.println(1.0 * currentState.TemperatureLogC[i] / TEMPERATURE_MULTIPLIER);
+  }
+  Serial.println("Temperature Graph:");
+  uint16_t low_temp       = currentState.TemperatureLogC[0];
+  uint16_t high_temp      = currentState.PeakTemperatureC * TEMPERATURE_MULTIPLIER;
+  uint8_t  temp_per_row   = (high_temp - low_temp) / GRAPH_ROWS;
+  uint16_t  sec_per_col    = currentState.NumTempSamples * SAMPLE_MULTIPLIER / GRAPH_COLS; //Value is actually 5/128ths of a second per unit
+  if (sec_per_col == 0 || high_temp <= low_temp + GRAPH_ROWS) {
+      return;
+  }
+  for (int8_t current_row = GRAPH_ROWS - 1; current_row >= 0; current_row--) {
+    uint16_t  pos;
+    if(current_row == GRAPH_ROWS - 1 || current_row % 4 == 0) {
+      print3d((current_row * temp_per_row + low_temp + TEMPERATURE_MULTIPLIER/2) / TEMPERATURE_MULTIPLIER);
+      Serial.print(" |");
+    } else {
+      Serial.print("    |");
+    }
+    for (pos = 0; pos < currentState.NumTempSamples * SAMPLE_MULTIPLIER; pos += sec_per_col) {
+      uint8_t idx = pos / SAMPLE_MULTIPLIER;
+      int32_t remainder = pos % SAMPLE_MULTIPLIER;
+      uint16_t temperature = (((currentState.TemperatureLogC[idx+1] - currentState.TemperatureLogC[idx])*remainder) / SAMPLE_MULTIPLIER + currentState.TemperatureLogC[idx]  - low_temp) / temp_per_row; //This is the row to use
+      if (temperature == current_row) {
+          Serial.print("*");
+      } else {
+          Serial.print(" ");
+      }
+    }
+    Serial.println("");
+  }
+  Serial.print("    |");
+  for (int i = 0; i < GRAPH_COLS; i++)  {
+     Serial.print("-");
+  }
+  Serial.println("");
+  Serial.print("     ");
+  for (int i = 0; i < GRAPH_COLS; i++)  {
+    Serial.print(i % 4 == 0 ? "|" : " ");
+  }
+  Serial.println("");
+  Serial.print("   ");
+  for (int i = 0; i < GRAPH_COLS; i+=4) {
+    print3d((i * sec_per_col + SAMPLE_MULTIPLIER/2) / SAMPLE_MULTIPLIER);
+    Serial.print(" ");
+  }
+  Serial.println("");
+}
+
 void MoveToNextPhase(char* reason, int timeInPhase)
 {
   Serial.print("**");
@@ -585,6 +687,7 @@ void Start()
   Serial.print("Starting Profile: "); Serial.println(profiles[currentState.SelectedProfile].Name);
   currentState.PeakTemperatureC = 0; // reset
   currentState.ActiveSince = millis(); // reset
+  currentState.NumTempSamples = 0;  // reset
   currentState.IsActive = true;
   TransitionToPhase(1);
 }
@@ -598,6 +701,7 @@ void End(boolean isUserInitiated)
   }
   Serial.print(", Total Elapsed Time: "); Serial.print((millis() - currentState.ActiveSince) / 1000); Serial.print("s");
   Serial.print(", Peak Temperature Observed: "); Serial.print(currentState.PeakTemperatureC); Serial.println("C");
+  DisplayTemperatureGraph();
   currentState.PeakTemperatureC = 0; // reset
   currentState.ActiveSince = millis(); // reset
   ResetState();
